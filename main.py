@@ -74,22 +74,32 @@ def retrieve_relevant_rules(vectorstore, transaction_description, k=3):
         return "\n---\n".join([doc.page_content for doc in docs])
     except Exception as e:
         print(f"Ошибка при поиске правил: {e}")
-        return "Ошибка при поиске в базе знаний. Используй общие правила."
+        return "Ошибка при поиске в базе знаний."
 
 
 print("\n=== Инициализация системы ===")
 vectorstore = setup_rag_knowledge_base()
 
 if not vectorstore:
-    print("\nВНИМАНИЕ: Система работает без RAG.")
+    print("ВНИМАНИЕ: Система работает без RAG.")
 
 template = ChatPromptTemplate.from_messages([
-    ("system", """Ты фрод-аналитик с доступом к базе знаний правил обнаружения мошенничества.
+    ("system", """Ты фрод-аналитик. Анализируй транзакцию строго по правилам из базы знаний.
 
-Контекст из базы знаний:
+Правила из базы знаний:
 {rag_context}
 
-Используй эти правила для анализа транзакции.
+ИНСТРУКЦИИ:
+- Начисляй баллы риска согласно правилам выше
+- risk_score — итоговая сумма баллов, строго от 1 до 10
+- Если сумма баллов превышает 10 — ставь 10
+- Если баллов нет — ставь минимум 1
+
+ШКАЛА ДЕЙСТВИЙ:
+- risk_score 1-3: низкий риск, action = approve
+- risk_score 4-7: средний риск, action = review
+- risk_score 8-10: высокий риск, action = block
+
 Возвращай ТОЛЬКО JSON без дополнительного текста.
 {format_instructions}"""),
     MessagesPlaceholder(variable_name="history"),
@@ -134,16 +144,21 @@ while True:
         print("Попробуйте переформулировать описание транзакции")
         continue
 
+    if response['risk_score'] > 10:
+        response['risk_score'] = 10
+    if response['risk_score'] < 1:
+        response['risk_score'] = 1
+
     history.append(HumanMessage(content=user_input))
     history.append(AIMessage(content=json.dumps(response, ensure_ascii=False)))
 
     print(f"\n{'=' * 50}")
-    if response['risk_score'] > 7:
+    if response['risk_score'] >= 8:
         print("ТРАНЗАКЦИЯ ЗАБЛОКИРОВАНА!")
         print(f"Риск: {response['risk_score']}/10")
         print(f"Причина: {response['reason']}")
         print(f"Действие: {response['action']}")
-    elif response['risk_score'] > 4:
+    elif response['risk_score'] >= 4:
         print("ВНИМАНИЕ: Повышенный риск!")
         print(f"Риск: {response['risk_score']}/10")
         print(f"Причина: {response['reason']}")
