@@ -54,7 +54,7 @@ AI сервис для анализа резюме на основе LangGraph. 
 ### Установка
 
 ```bash
-git clone https://github.com/твой-username/resume-analyzer
+git clone https://github.com/boshka22/langchain_start
 cd resume-analyzer
 ```
 
