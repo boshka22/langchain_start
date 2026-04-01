@@ -10,32 +10,35 @@ AI сервис для анализа резюме на основе LangGraph. 
 │  POST /analyze   GET /analyze/{task_id}/status               │
 │  GET /history    GET /{id}                                   │
 └──────────────────────────┬──────────────────────────────────┘
-                           │ 202 Accepted + task_id
-                           ▼
-                         Redis
-                      (broker + backend)
                            │
-                    Celery Worker
-                           │
-          ┌────────────────┴────────────────┐
-          │                                 │
-    LangGraph Graph                   ResumeRepository
-          │                                 │
-          │  ┌─────────────────────┐        │
-          │  │   Параллельные      │        │
-          ├──│   агенты            │     PostgreSQL
-          │  │                     │
-          │  │  analyze_skills     │
-          │  │  analyze_experience │
-          │  │  analyze_structure  │
-          │  │  analyze_language   │
-          │  └────────┬────────────┘
-          │           │
-          │    compile_report
-          │
-          └───────────┘
-                           │
-              (опционально) webhook → callback_url
+                    ┌──────▼──────┐
+                    │    Redis     │
+                    │  cache hit?  │
+                    └──────┬──────┘
+               HIT ◄───────┴───────► MISS
+           (мгновенно)              (202 + task_id)
+                                         │
+                                  Celery Worker
+                                         │
+                     ┌───────────────────┴────────────────┐
+                     │                                     │
+               LangGraph Graph                    ResumeRepository
+                     │                                     │
+               ┌─────────────┐                         PostgreSQL
+               │  Параллельные│
+               │   агенты     │
+               │              │
+               │ analyze_skills
+               │ analyze_experience
+               │ analyze_structure
+               │ analyze_language
+               └──────┬───────┘
+                      │
+               compile_report
+                      │
+               сохранить в БД + кэш Redis (TTL 24ч)
+                      │
+         (опционально) webhook → callback_url
 ```
 
 ## Стек
@@ -45,6 +48,7 @@ AI сервис для анализа резюме на основе LangGraph. 
 - **LangGraph** — оркестрация агентов
 - **LangChain** — интеграция с LLM провайдерами
 - **Celery + Redis** — фоновая обработка и очередь задач
+- **Redis Cache** — кэширование результатов (Cache-Aside, TTL 24ч)
 - **PostgreSQL 16** — хранение истории анализов
 - **SQLAlchemy** — асинхронный ORM
 - **Docker + docker-compose** — контейнеризация
@@ -124,11 +128,27 @@ ollama pull llama3.2
 
 ## Как работает асинхронный анализ
 
+### Без кэша (первый запрос)
+
 ```
-1. POST /analyze + файл  →  202 Accepted  {"task_id": "uuid", "status": "pending"}
+1. POST /analyze + файл
+   → X-Cache: MISS
+   → 202 Accepted {"task_id": "uuid", "status": "pending", "cached": false}
+
 2. GET /analyze/{task_id}/status  →  {"status": "started", "result": null}
 3. GET /analyze/{task_id}/status  →  {"status": "success", "result": {...}}
 ```
+
+### С кэшем (повторный запрос того же резюме)
+
+```
+1. POST /analyze + файл
+   → X-Cache: HIT
+   → 202 Accepted {"task_id": "cached", "status": "success", "cached": true, "result": {...}}
+```
+
+Повторный запрос возвращает результат мгновенно — Celery не задействуется.
+Кэш живёт 24 часа, ключ — MD5 хэш текста резюме.
 
 Опционально — передай `callback_url` в форме запроса. Когда анализ завершится, воркер сам сделает POST на этот URL с результатом.
 
@@ -142,12 +162,26 @@ ollama pull llama3.2
 | `GET` | `/api/v1/resume/{id}` | Получение анализа по ID из БД |
 | `GET` | `/health` | Проверка работоспособности |
 
-## Пример ответа
+## Примеры ответов
+
+### Новый анализ (кэш MISS)
 
 ```json
 {
   "task_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "cached": false,
+  "result": null
+}
+```
+
+### Результат из кэша (кэш HIT)
+
+```json
+{
+  "task_id": "cached",
   "status": "success",
+  "cached": true,
   "result": {
     "status": "success",
     "overall_score": 8,
@@ -189,6 +223,8 @@ resume_analyzer/
 │   ├── api/
 │   │   └── v1/
 │   │       └── resume.py        # роутеры
+│   ├── cache/
+│   │   └── resume.py            # Cache-Aside кэширование в Redis
 │   ├── core/
 │   │   ├── config.py            # настройки
 │   │   └── database.py          # подключение к БД
@@ -216,6 +252,7 @@ resume_analyzer/
 │   │   └── test_parsers.py
 │   └── integration/
 │       ├── test_api.py
+│       ├── test_cache.py
 │       └── test_repository.py
 ├── docker-compose.yml
 ├── Dockerfile
@@ -253,6 +290,19 @@ pre-commit install
 pre-commit run --all-files
 ```
 
+### Проверка кэша в Redis
+
+```bash
+# Зайти в Redis CLI
+docker exec -it resume_analyzer_redis redis-cli
+
+# Посмотреть все ключи кэша
+KEYS resume:analysis:*
+
+# Проверить TTL ключа
+TTL resume:analysis:<хэш>
+```
+
 ## Roadmap
 
 - [x] Анализ резюме через LangGraph с параллельными агентами
@@ -262,10 +312,10 @@ pre-commit run --all-files
 - [x] Celery + Redis — фоновая обработка, поллинг статуса
 - [x] Webhook уведомления (callback_url)
 - [x] Поддержка нескольких LLM провайдеров (Groq, Gemini, Ollama)
+- [x] Кэширование результатов через Redis (Cache-Aside, TTL 24ч)
 - [x] Docker + docker-compose
 - [x] Линтеры (ruff, mypy) и pre-commit хуки
 - [x] Тесты с testcontainers
-- [ ] Кэширование результатов через Redis
 - [ ] Аутентификация (JWT)
 - [ ] Сравнение резюме с вакансией
 - [ ] Экспорт отчёта в PDF
